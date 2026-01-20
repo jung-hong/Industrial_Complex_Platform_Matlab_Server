@@ -1,0 +1,7 @@
+{
+	"RuntimeDependencies": [
+		{"ID":35010, "DisplayName":"MATLAB Base Runtime", "Optional":"no"},
+		{"ID":35055, "DisplayName":"Python Target Runtime Addon", "Optional":"no"},
+		{"ID":35130, "DisplayName":"Financial Toolbox Runtime Addon", "Optional":"no"}
+	]
+}
