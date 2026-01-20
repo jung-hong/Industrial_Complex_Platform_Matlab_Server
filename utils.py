@@ -2,79 +2,89 @@
 import numpy as np
 import cv2
 from shapely import wkb
-from shapely.geometry import Polygon
+from shapely.ops import transform
+from shapely.geometry import Polygon, MultiPolygon
+import pyproj
 import os
 
-def process_building_geometry(geom_wkb, floor_count, output_dir, file_prefix):
+# 좌표 변환기 설정
+# DB(4326: 위경도) -> 미터 좌표계(5179: Korea 2000 / UTM-K)
+# 만약 DB가 이미 TM좌표라면 source_crs를 5174 등으로 변경해야 함
+transformer = pyproj.Transformer.from_crs("epsg:4326", "epsg:5179", always_xy=True).transform
+
+def create_simulation_inputs(target_geom_wkb, neighbor_list, output_dir, file_prefix):
     """
-    DB의 WKB 지오메트리를 받아서 NPY 파일(DSM, 마스크)을 생성
+    타겟 건물과 주변 건물을 받아 MATLAB 시뮬레이션용 NPY 파일을 생성함.
+    :param target_geom_wkb: 타겟 건물의 기하정보 (중심점 계산용)
+    :param neighbor_list: [{'geom': wkb, 'height': float, 'is_target': bool}, ...]
+    :return: (dsm_path, roof_mask_path, facade_mask_path)
     """
-    # 1. 층수 처리 (NULL이면 1층, 층고 3.3m)
-    if floor_count is None or floor_count == 0:
-        floors = 1
-    else:
-        floors = floor_count
-    building_height = floors * 3.3
-
-    # 2. WKB -> Shapely Polygon 변환
-    polygon = wkb.loads(bytes.fromhex(geom_wkb) if isinstance(geom_wkb, str) else geom_wkb)
+    CANVAS_SIZE = 1000   # 1000 x 1000 픽셀
+    PIXEL_PER_METER = 1.0 # 1픽셀 = 1미터
     
-    # 3. 좌표 정규화 (건물을 1000x1000 캔버스 중앙에 배치)
-    # 실제 시뮬레이션에서는 주변 지형도 중요하겠지만, 
-    # 현재는 단일 건물의 형상과 높이만 고려하여 중앙에 배치합니다.
-    minx, miny, maxx, maxy = polygon.bounds
-    width = maxx - minx
-    height = maxy - miny
+    # 1. 타겟 건물의 중심점(Anchor) 계산
+    # 이 점이 캔버스의 (500, 500) 위치가 됩니다.
+    target_poly = wkb.loads(bytes.fromhex(target_geom_wkb) if isinstance(target_geom_wkb, str) else target_geom_wkb)
+    target_meter = transform(transformer, target_poly) # 미터 좌표로 변환
+    center_x, center_y = target_meter.centroid.x, target_meter.centroid.y
+
+    # 2. 캔버스 초기화 (0으로 채움)
+    dsm = np.zeros((CANVAS_SIZE, CANVAS_SIZE), dtype=np.float64)       # 높이 맵
+    mask_roof = np.zeros((CANVAS_SIZE, CANVAS_SIZE), dtype=np.uint8)   # 지붕 마스크
     
-    # 캔버스 설정 (1000x1000 픽셀)
-    canvas_size = 1000
-    scale = 1.0  # 1픽셀 = 1미터라고 가정 (필요시 조정)
-    
-    # 건물을 중앙으로 옮기기 위한 오프셋 계산
-    offset_x = (canvas_size - width * scale) / 2 - minx * scale
-    offset_y = (canvas_size - height * scale) / 2 - miny * scale
+    # 3. 주변 건물 리스트를 순회하며 그리기
+    for building in neighbor_list:
+        # DB에서 가져온 WKB를 Shapely 객체로 변환
+        b_wkb = building['geom']
+        poly_geo = wkb.loads(bytes.fromhex(b_wkb) if isinstance(b_wkb, str) else b_wkb)
+        
+        # 미터 좌표계로 변환
+        poly_meter = transform(transformer, poly_geo)
+        
+        # 캔버스(이미지) 좌표계로 변환하는 함수
+        def to_pixel_coords(geom_meter):
+            coords_list = []
+            # Polygon이든 MultiPolygon이든 외곽선 추출
+            if geom_meter.geom_type == 'Polygon':
+                boundaries = [geom_meter.exterior.coords]
+            elif geom_meter.geom_type == 'MultiPolygon':
+                boundaries = [p.exterior.coords for p in geom_meter.geoms]
+            else:
+                return []
 
-    # 좌표 변환 함수
-    def transform_coords(coords):
-        transformed = []
-        for x, y in coords:
-            tx = int(x * scale + offset_x)
-            ty = int(y * scale + offset_y)
-            transformed.append([tx, ty])
-        return np.array(transformed, np.int32)
+            pixel_polys = []
+            for coords in boundaries:
+                pts = []
+                for x, y in coords:
+                    # 중심점 기준 상대 좌표 계산 + 캔버스 중앙 이동
+                    px = int((x - center_x) * PIXEL_PER_METER + (CANVAS_SIZE / 2))
+                    # 이미지는 y축이 아래로 내려갈수록 증가하므로 뒤집기 (반전)
+                    py = int((CANVAS_SIZE / 2) - (y - center_y) * PIXEL_PER_METER)
+                    pts.append([px, py])
+                pixel_polys.append(np.array(pts, np.int32))
+            return pixel_polys
 
-    # 폴리곤 외곽선 좌표 추출
-    if isinstance(polygon, Polygon):
-        pts = transform_coords(polygon.exterior.coords)
-        polys = [pts]
-    else: # MultiPolygon인 경우
-        polys = []
-        for p in polygon.geoms:
-            polys.append(transform_coords(p.exterior.coords))
+        pixel_polys = to_pixel_coords(poly_meter)
+        
+        if not pixel_polys:
+            continue
 
-    # 4. NPY 데이터 생성
-    # DSM: 바닥은 0, 건물 영역은 building_height 값
-    dsm = np.zeros((canvas_size, canvas_size), dtype=np.float64)
-    cv2.fillPoly(dsm, polys, color=building_height)
+        # A. DSM 그리기 (건물 높이로 색칠) -> 주변 건물 그림자 효과용
+        cv2.fillPoly(dsm, pixel_polys, color=building['height'])
+        
+        # B. 타겟 마스크 그리기 (1로 색칠) -> 분석 대상 영역
+        if building['is_target']:
+            cv2.fillPoly(mask_roof, pixel_polys, color=1)
 
-    # 지붕 마스크: 건물 영역은 1, 나머지는 0
-    mask_roof = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
-    cv2.fillPoly(mask_roof, polys, color=1)
-    
-    # 외벽 마스크 (간단하게 외곽선만 1로 처리하거나, 로직에 따라 전체 채움)
-    # 기존 코드 로직에 따라 일단 지붕과 동일하게 채우거나 별도 처리
-    # 여기서는 편의상 동일 영역을 타겟으로 잡습니다.
-    mask_facade = mask_roof.copy()
-
-    # 5. 파일 저장
+    # 4. 파일 저장
     os.makedirs(output_dir, exist_ok=True)
     
     path_dsm = os.path.join(output_dir, f"{file_prefix}_floco.npy")
     path_roof = os.path.join(output_dir, f"{file_prefix}_rm_roof.npy")
-    path_facade = os.path.join(output_dir, f"{file_prefix}_rm_facade.npy")
+    path_facade = os.path.join(output_dir, f"{file_prefix}_rm_facade.npy") # 외벽도 지붕과 같은 영역으로 가정
 
     np.save(path_dsm, dsm)
     np.save(path_roof, mask_roof)
-    np.save(path_facade, mask_facade)
+    np.save(path_facade, mask_roof) # 외벽 마스크도 일단 동일하게 저장
 
     return path_dsm, path_roof, path_facade

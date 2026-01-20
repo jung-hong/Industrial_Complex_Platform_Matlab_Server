@@ -7,129 +7,185 @@ import os
 import uuid
 import pandas as pd
 import shutil
-from typing import Optional
 
-# 우리가 만든 모듈
+# 만든 모듈 임포트
 from database import get_db
-from utils import process_building_geometry
+from utils import create_simulation_inputs
 
-# MATLAB 관련 (설치된 패키지 이름 확인 필요)
-import matlab
-import SNUs_dsm2irrPkg
+# MATLAB 관련 (Windows 서버 환경 가정)
+# Mac에서 개발중이라면 try-except로 가짜 모듈 처리 필요
+try:
+    import matlab
+    import SNUs_dsm2irrPkg
+    MATLAB_AVAILABLE = True
+except ImportError:
+    print("Warning: MATLAB Runtime not found. Using Mock mode.")
+    MATLAB_AVAILABLE = False
+    matlab = None
 
-app = FastAPI(title="Solar Simulation API")
+app = FastAPI()
 
-# --- 전역 변수: MATLAB 엔진 ---
+# MATLAB 엔진 전역 변수 & 락
 matlab_pkg = None
 engine_lock = asyncio.Lock()
 
 @app.on_event("startup")
 def startup_event():
     global matlab_pkg
-    print(">>> Initializing MATLAB Runtime... (Please wait)")
-    try:
-        matlab_pkg = SNUs_dsm2irrPkg.initialize()
-        print(">>> MATLAB Initialized Successfully.")
-    except Exception as e:
-        print(f">>> MATLAB Initialization Failed: {e}")
+    if MATLAB_AVAILABLE:
+        print(">>> Initializing MATLAB Runtime...")
+        try:
+            matlab_pkg = SNUs_dsm2irrPkg.initialize()
+            print(">>> MATLAB Runtime initialized.")
+        except Exception as e:
+            print(f">>> Initialization Failed: {e}")
 
 @app.on_event("shutdown")
 def shutdown_event():
     global matlab_pkg
     if matlab_pkg:
         matlab_pkg.terminate()
-        print(">>> MATLAB Terminated.")
-
-# --- API 요청 모델 ---
-# DB ID만 받으면 됨
 
 @app.post("/simulate/{building_id}")
 async def run_simulation(building_id: int, db: Session = Depends(get_db)):
+    """
+    건물 ID를 받아 주변 건물 정보를 포함한 NPY를 생성하고 시뮬레이션을 돌림
+    """
     global matlab_pkg
-    if not matlab_pkg:
+    
+    if MATLAB_AVAILABLE and not matlab_pkg:
         raise HTTPException(status_code=500, detail="MATLAB engine not ready")
 
-    # 1. DB에서 건물 정보 조회 (Raw SQL 사용)
-    # geoalchemy2가 있으면 ORM도 되지만, shapely 변환을 위해 WKB로 가져옵니다.
-    query = text("""
-        SELECT id, geom, gro_flo_co 
+    # =========================================================
+    # 1. DB 조회: 타겟 건물 + 주변 건물 (반경 700m)
+    # =========================================================
+    
+    # 1-1. 타겟 건물의 기하 정보 먼저 확보 (중심점용)
+    target_query = text("SELECT geom FROM building_gis WHERE id = :bid")
+    target_res = db.execute(target_query, {"bid": building_id}).fetchone()
+    
+    if not target_res:
+        raise HTTPException(status_code=404, detail="Target building not found")
+    
+    target_geom_raw = target_res[0] # WKB 형태
+
+    # 1-2. 주변 건물 검색 (PostGIS ST_DWithin 사용)
+    # 캔버스가 1000m x 1000m 이므로 반경 500m 이상(안전하게 700m) 검색
+    # geom이 4326(위경도)라면 ::geography 캐스팅 필요
+    neighbors_query = text("""
+        SELECT 
+            id, 
+            geom, 
+            COALESCE(gro_flo_co, 1) as floors 
         FROM building_gis 
-        WHERE id = :bid
+        WHERE ST_DWithin(
+            geom::geography, 
+            (SELECT geom::geography FROM building_gis WHERE id = :bid), 
+            700
+        )
     """)
-    result = db.execute(query, {"bid": building_id}).fetchone()
     
-    if not result:
-        raise HTTPException(status_code=404, detail="Building not found")
+    neighbors = db.execute(neighbors_query, {"bid": building_id}).fetchall()
     
-    b_id, geom_wkb, floor_count = result
-    
-    # 2. 전처리: NPY 파일 생성
+    # Python 리스트로 가공
+    building_list = []
+    for row in neighbors:
+        bid, bgeom, floors = row
+        
+        # 높이 계산 (층수 * 3.3m)
+        height = float(floors) * 3.3
+        if height <= 0: height = 3.3 # 최소 높이 보정
+        
+        building_list.append({
+            "geom": bgeom,
+            "height": height,
+            "is_target": (bid == building_id) # 타겟 건물 여부 체크
+        })
+
+    # =========================================================
+    # 2. 전처리: NPY 파일 생성 (utils.py 위임)
+    # =========================================================
     req_uuid = str(uuid.uuid4())
-    temp_dir = os.path.join("temp", req_uuid) # 임시 폴더
+    temp_dir = os.path.abspath(os.path.join("temp", req_uuid))
     
     try:
-        dsm_path, roof_mask_path, facade_mask_path = process_building_geometry(
-            geom_wkb, floor_count, temp_dir, f"sample_{req_uuid}"
+        # 여기서 1픽셀=1미터 변환 및 파일 생성이 수행됨
+        dsm_path, roof_mask, facade_mask = create_simulation_inputs(
+            target_geom_raw, building_list, temp_dir, f"sample_{req_uuid}"
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Preprocessing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Preprocessing failed: {str(e)}")
 
+    # =========================================================
     # 3. MATLAB 시뮬레이션 실행
-    # 날씨 파일은 RE100 폴더에 있다고 가정 (경로 확인 필수)
-    weather_csv = os.path.abspath("RE100/38.csv") 
-    output_csv_roof = os.path.join(temp_dir, "result_roof.csv")
+    # =========================================================
     
-    # 결과 담을 변수
-    simulation_result = {}
+    # 날씨 파일 (RE100 폴더 내 38.csv)
+    weather_csv = os.path.abspath("RE100/38.csv")
+    if not os.path.exists(weather_csv):
+         raise HTTPException(status_code=500, detail="Weather file not found")
 
-    async with engine_lock: # 동시 실행 방지
-        try:
-            # 변수 캐스팅 (MATLAB 타입)
-            tmydir = weather_csv
-            tmylat = matlab.double(37.6)
-            tmylon = matlab.double(127.2)
-            tmyele = matlab.double(129.0)
-            
-            # 입력 파일 경로는 절대 경로로 주는 것이 안전
-            dsmdir = os.path.abspath(dsm_path)
-            regionmapdir = os.path.abspath(roof_mask_path)
-            
-            # A. 지붕 계산 (Roof)
-            print(">>> Running Roof Simulation...")
-            matlab_pkg.SNUsolar_dsm2irr(
-                tmydir, tmylat, tmylon, tmyele, 
-                dsmdir, regionmapdir, 
-                matlab.logical(False), # isfacade=False
-                matlab.double(0),      # pzen=0
-                matlab.double(180),    # pazi=180
-                output_csv_roof
-            )
-            
-            # 결과 파일 읽기
-            if os.path.exists(output_csv_roof):
-                df = pd.read_csv(output_csv_roof)
-                # NaN 값을 None으로 변환 (JSON 호환성)
-                simulation_result['roof'] = df.where(pd.notnull(df), None).to_dict(orient='records')
-            
-            # B. 필요하다면 외벽 계산(Facade)도 여기에 추가 가능
-            # (regionmapdir를 facade_mask_path로 변경 후 호출)
+    output_csv = os.path.join(temp_dir, "result_roof.csv")
+    results = {}
 
-        except Exception as e:
-            print(f"MATLAB Error: {e}")
-            raise HTTPException(status_code=500, detail=f"Simulation error: {str(e)}")
-        finally:
-            # 임시 파일 삭제 (디버깅 때는 주석 처리하세요)
-            # shutil.rmtree(temp_dir, ignore_errors=True)
-            pass
+    if MATLAB_AVAILABLE:
+        async with engine_lock:
+            try:
+                # MATLAB 변수 캐스팅
+                tmydir = weather_csv
+                tmylat = matlab.double(37.6)
+                tmylon = matlab.double(127.2)
+                tmyele = matlab.double(129.0)
+                
+                dsmdir = dsm_path
+                regionmapdir = roof_mask
+                
+                print(f">>> Running Simulation for ID {building_id}...")
+                
+                # 지붕 계산 호출
+                matlab_pkg.SNUsolar_dsm2irr(
+                    tmydir, tmylat, tmylon, tmyele, 
+                    dsmdir, regionmapdir, 
+                    matlab.logical(False), # isfacade=False
+                    matlab.double(0),      # pzen
+                    matlab.double(180),    # pazi
+                    output_csv
+                )
+                
+                # 결과 읽기
+                if os.path.exists(output_csv):
+                    df = pd.read_csv(output_csv)
+                    # JSON 직렬화를 위해 NaN을 None으로
+                    results['roof'] = df.where(pd.notnull(df), None).to_dict(orient='records')
+                else:
+                    results['error'] = "Output CSV was not generated."
+
+            except Exception as e:
+                print(f"MATLAB Error: {e}")
+                raise HTTPException(status_code=500, detail=f"Simulation Error: {str(e)}")
+    else:
+        # Mac 개발 환경용 Mock Data
+        results['roof'] = [{"mock_data": "True", "radiation": 123.45}]
+        print("!!! Mock Simulation Finished !!!")
+
+    # =========================================================
+    # 4. 마무리 및 리턴
+    # =========================================================
+    
+    # 임시 파일 삭제 (디버깅용으로 주석 처리 가능)
+    # try:
+    #     shutil.rmtree(temp_dir)
+    # except:
+    #     pass
 
     return {
-        "building_id": b_id,
-        "floor_count": floor_count,
+        "building_id": building_id,
+        "total_buildings_processed": len(building_list),
         "status": "success",
-        "data": simulation_result
+        "data": results
     }
 
 if __name__ == "__main__":
     import uvicorn
-    # 프로젝트 폴더 내에 RE100 폴더와 날씨 파일이 있어야 함
+    # RE100 폴더가 있는지 꼭 확인!
     uvicorn.run(app, host="0.0.0.0", port=8000)
