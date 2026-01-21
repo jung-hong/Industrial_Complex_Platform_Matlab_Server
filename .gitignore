@@ -1,0 +1,71 @@
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Logs
+*.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------
+# Runtime / temp outputs (your project)
+# ------------------------------------------------------------
+temp/
+*.npy
+*.npz
+
+# If you generate result csvs in temp, ignore them too
+temp/**/*.csv
+
+# ------------------------------------------------------------
+# MATLAB / compiled runtime generated artifacts (optional)
+# ------------------------------------------------------------
+# If SNUs_dsm2irrPkgpythonPackage is generated/installed artifact, ignore it.
+# (If you want to keep it in repo, remove this line)
+SNUs_dsm2irrPkgpythonPackage/
+
+# MATLAB caches (if any)
+*.asv
+*.m~
+
+
+# ------------------------------------------------------------
+# Data folder policy (choose one)
+# ------------------------------------------------------------
+# Option A) Ignore entire RE100 dataset folder (recommended if large/private)
+RE100/*
+# Keep only the sample weather file if you want it tracked
+!RE100/38.csv
+!RE100/.gitkeep
+
+# Option B) If you DO want to commit all RE100 data, then comment out above
+# and remove these lines.

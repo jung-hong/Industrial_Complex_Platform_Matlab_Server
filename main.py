@@ -1,13 +1,42 @@
+import os
+import sys
+
+# -------------------------------------------------------------
+# [1] MATLAB Runtime 경로 설정 (두 곳 모두 필요!)
+# -------------------------------------------------------------
+# 1. libmx.dll 등이 있는 곳
+path_bin = r"C:\Program Files\MATLAB\MATLAB Runtime\R2025a\bin\win64"
+# 2. mclmcrrt25_1.dll (핵심 파일)이 있는 곳
+path_runtime = r"C:\Program Files\MATLAB\MATLAB Runtime\R2025a\runtime\win64"
+
+# 두 경로를 모두 환경 변수 PATH에 추가
+os.environ['PATH'] = path_bin + os.pathsep + path_runtime + os.pathsep + os.environ['PATH']
+
+# Python 3.8+ 보안 해제 (두 경로 모두 허용)
+if hasattr(os, 'add_dll_directory'):
+    try:
+        if os.path.exists(path_bin): os.add_dll_directory(path_bin)
+        if os.path.exists(path_runtime): os.add_dll_directory(path_runtime)
+    except Exception as e:
+        print(f">>> [Warning] DLL path add failed: {e}")
+
+# -------------------------------------------------------------
+# [2] 라이브러리 임포트
+# -------------------------------------------------------------
+import SNUs_dsm2irrPkg  # 이제 runtime 폴더를 찾을 수 있어서 성공할 겁니다!
+import matlab
+
+
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import asyncio
-import os
 import uuid
 import pandas as pd
 import shutil
-import matlab
-import SNUs_dsm2irrPkg  # 패키지 설치 필수
+
+import SNUs_dsm2irrPkg  # <-- 이걸 먼저 쓰세요 (환경 로딩 유도)
+import matlab           # <-- 그 다음에 matlab 타입 정의 불러오기
 
 from database import get_db
 from utils import create_simulation_inputs
@@ -54,9 +83,13 @@ async def run_simulation(building_id: int, db: Session = Depends(get_db)):
 
         # 주변 검색
         query = text("""
-            SELECT id, geom, COALESCE(gro_flo_co, 1) as floors 
-            FROM building_gis 
-            WHERE ST_DWithin(geom::geography, (SELECT geom::geography FROM building_gis WHERE id = :bid), 700)
+            SELECT id, geom, COALESCE(gro_flo_co, 1) as floors
+            FROM building_gis
+            WHERE ST_DWithin(
+                geom,
+                (SELECT geom FROM building_gis WHERE id = :bid),
+                700
+            )
         """)
         neighbors = db.execute(query, {"bid": building_id}).fetchall()
     except Exception as e:
